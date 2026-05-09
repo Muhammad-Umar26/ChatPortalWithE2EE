@@ -2,11 +2,11 @@ __pycache__/
 *.pyc
 .venv/
 venv/
-backend\.venv/
-backend\chat_portal.db
+backend/.venv/
+backend/chat_portal.db
 
-frontend\node_modules/
-frontend\dist/
+frontend/node_modules/
+frontend/dist/
 
 .DS_Store
 Thumbs.db
