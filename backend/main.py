@@ -18,7 +18,7 @@ import secrets
 import sqlite3
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from fastapi import Depends, FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect, status
@@ -34,6 +34,7 @@ APP_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(APP_DIR, "chat_portal.db")
 TOKEN_SECRET = os.getenv("CHAT_TOKEN_SECRET", "replace-this-in-production")
 TOKEN_TTL_SECONDS = 7 * 24 * 60 * 60
+ONLINE_WINDOW_SECONDS = int(os.getenv("ONLINE_WINDOW_SECONDS", "90"))
 DEFAULT_CORS_ORIGINS = ["http://localhost:5173", "http://127.0.0.1:5173"]
 ENV_CORS_ORIGINS = [value.strip() for value in os.getenv("CORS_ALLOW_ORIGINS", "").split(",") if value.strip()]
 CORS_ALLOW_ORIGIN_REGEX = os.getenv(
@@ -59,6 +60,10 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def online_cutoff_iso() -> str:
+    return (datetime.now(timezone.utc) - timedelta(seconds=ONLINE_WINDOW_SECONDS)).isoformat()
+
+
 def get_conn() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
@@ -76,6 +81,8 @@ def init_db() -> None:
                 display_name TEXT NOT NULL,
                 password_hash TEXT NOT NULL,
                 public_key TEXT,
+                last_seen_at TEXT,
+                is_online INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL
             );
 
@@ -101,6 +108,8 @@ def init_db() -> None:
                 room_id TEXT NOT NULL,
                 sender_id INTEGER NOT NULL,
                 payload TEXT NOT NULL,
+                is_deleted INTEGER NOT NULL DEFAULT 0,
+                deleted_at TEXT,
                 created_at TEXT NOT NULL,
                 FOREIGN KEY (room_id) REFERENCES rooms(id) ON DELETE CASCADE,
                 FOREIGN KEY (sender_id) REFERENCES users(id) ON DELETE CASCADE
@@ -109,6 +118,27 @@ def init_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_messages_room_id ON messages(room_id, id);
             """
         )
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(users)").fetchall()}
+        if "last_seen_at" not in columns:
+            conn.execute("ALTER TABLE users ADD COLUMN last_seen_at TEXT")
+        if "is_online" not in columns:
+            conn.execute("ALTER TABLE users ADD COLUMN is_online INTEGER NOT NULL DEFAULT 0")
+        message_columns = {row["name"] for row in conn.execute("PRAGMA table_info(messages)").fetchall()}
+        if "is_deleted" not in message_columns:
+            conn.execute("ALTER TABLE messages ADD COLUMN is_deleted INTEGER NOT NULL DEFAULT 0")
+        if "deleted_at" not in message_columns:
+            conn.execute("ALTER TABLE messages ADD COLUMN deleted_at TEXT")
+
+
+def set_user_presence(user_id: int, *, online: bool) -> None:
+    with get_conn() as conn:
+        if online:
+            conn.execute(
+                "UPDATE users SET is_online = 1, last_seen_at = ? WHERE id = ?",
+                (now_iso(), user_id),
+            )
+            return
+        conn.execute("UPDATE users SET is_online = 0 WHERE id = ?", (user_id,))
 
 
 def b64url_encode(data: bytes) -> str:
@@ -240,6 +270,14 @@ class RoomCreateRequest(BaseModel):
     name: str = Field(min_length=2, max_length=80)
 
 
+class RoomMemberMutationRequest(BaseModel):
+    user_id: int = Field(gt=0)
+
+
+class OwnerLeaveRequest(BaseModel):
+    new_owner_id: int = Field(gt=0)
+
+
 class FTPUploadPlaceholderRequest(BaseModel):
     room_id: str = Field(min_length=4, max_length=64)
     file_name: str = Field(min_length=1, max_length=255)
@@ -306,7 +344,7 @@ class ConnectionManager:
             self.disconnect(room_id, uid)
 
     async def broadcast_online_count(self, room_id: str) -> None:
-        total_online = self.room_client_count(room_id)
+        total_online = self.room_online_count(room_id)
         payload = json.dumps(
             {
                 "type": "online_count",
@@ -326,8 +364,38 @@ class ConnectionManager:
     def room_client_count(self, room_id: str) -> int:
         return len(self.active_connections.get(room_id, {}))
 
+    def room_online_count(self, room_id: str) -> int:
+        with get_conn() as conn:
+            return int(
+                conn.execute(
+                    """
+                    SELECT COUNT(*) AS n
+                    FROM room_members rm
+                    JOIN users u ON u.id = rm.user_id
+                    WHERE rm.room_id = ?
+                      AND u.is_online = 1
+                      AND u.last_seen_at IS NOT NULL
+                      AND u.last_seen_at >= ?
+                    """,
+                    (room_id, online_cutoff_iso()),
+                ).fetchone()["n"]
+            )
+
     def total_client_count(self) -> int:
         return sum(len(room) for room in self.active_connections.values())
+
+    async def broadcast_presence_for_user(self, user_id: int) -> None:
+        active_room_ids = list(self.active_connections.keys())
+        if not active_room_ids:
+            return
+        with get_conn() as conn:
+            for room_id in active_room_ids:
+                is_member = conn.execute(
+                    "SELECT 1 FROM room_members WHERE room_id = ? AND user_id = ?",
+                    (room_id, user_id),
+                ).fetchone()
+                if is_member is not None:
+                    await self.broadcast_online_count(room_id)
 
 
 manager = ConnectionManager()
@@ -372,6 +440,8 @@ async def register(payload: RegisterRequest) -> dict[str, Any]:
         user_id = int(cursor.lastrowid)
         row = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
 
+    set_user_presence(user_id, online=True)
+    await manager.broadcast_presence_for_user(user_id)
     token = create_access_token(user_id=user_id, username=username)
     return {"token": token, "user": serialize_user(row)}
 
@@ -385,13 +455,31 @@ async def login(payload: LoginRequest) -> dict[str, Any]:
     if row is None or not verify_password(payload.password, row["password_hash"]):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid username or password")
 
+    set_user_presence(int(row["id"]), online=True)
+    await manager.broadcast_presence_for_user(int(row["id"]))
     token = create_access_token(user_id=row["id"], username=row["username"])
     return {"token": token, "user": serialize_user(row)}
 
 
 @app.get("/auth/me")
 async def me(current_user: dict[str, Any] = Depends(get_current_user)) -> dict[str, Any]:
+    set_user_presence(int(current_user["id"]), online=True)
+    await manager.broadcast_presence_for_user(int(current_user["id"]))
     return {"user": current_user}
+
+
+@app.post("/auth/ping")
+async def ping(current_user: dict[str, Any] = Depends(get_current_user)) -> dict[str, Any]:
+    set_user_presence(int(current_user["id"]), online=True)
+    await manager.broadcast_presence_for_user(int(current_user["id"]))
+    return {"ok": True}
+
+
+@app.post("/auth/logout")
+async def logout(current_user: dict[str, Any] = Depends(get_current_user)) -> dict[str, Any]:
+    set_user_presence(int(current_user["id"]), online=False)
+    await manager.broadcast_presence_for_user(int(current_user["id"]))
+    return {"ok": True}
 
 
 @app.put("/auth/public-key")
@@ -409,6 +497,7 @@ async def update_public_key(
 
 @app.get("/rooms")
 async def list_rooms(current_user: dict[str, Any] = Depends(get_current_user)) -> dict[str, Any]:
+    cutoff = online_cutoff_iso()
     with get_conn() as conn:
         rows = conn.execute(
             """
@@ -419,14 +508,23 @@ async def list_rooms(current_user: dict[str, Any] = Depends(get_current_user)) -
                 r.created_at,
                 owner.username AS owner_username,
                 owner.display_name AS owner_display_name,
-                (SELECT COUNT(*) FROM room_members rm2 WHERE rm2.room_id = r.id) AS member_count
+                (SELECT COUNT(*) FROM room_members rm2 WHERE rm2.room_id = r.id) AS member_count,
+                (
+                    SELECT COUNT(*)
+                    FROM room_members rm3
+                    JOIN users u3 ON u3.id = rm3.user_id
+                    WHERE rm3.room_id = r.id
+                      AND u3.is_online = 1
+                      AND u3.last_seen_at IS NOT NULL
+                      AND u3.last_seen_at >= ?
+                ) AS online_member_count
             FROM room_members rm
             JOIN rooms r ON r.id = rm.room_id
             JOIN users owner ON owner.id = r.owner_id
             WHERE rm.user_id = ?
             ORDER BY r.created_at DESC
             """,
-            (current_user["id"],),
+            (cutoff, current_user["id"]),
         ).fetchall()
 
     rooms = [
@@ -437,6 +535,7 @@ async def list_rooms(current_user: dict[str, Any] = Depends(get_current_user)) -
             "owner_username": row["owner_username"],
             "owner_display_name": row["owner_display_name"],
             "member_count": row["member_count"],
+            "online_member_count": row["online_member_count"],
             "is_owner": row["owner_id"] == current_user["id"],
             "created_at": row["created_at"],
         }
@@ -471,6 +570,7 @@ async def create_room(
             "owner_username": current_user["username"],
             "owner_display_name": current_user["display_name"],
             "member_count": 1,
+            "online_member_count": 1,
             "is_owner": True,
             "created_at": created_at,
         }
@@ -480,6 +580,7 @@ async def create_room(
 @app.post("/rooms/{room_id}/join")
 async def join_room(room_id: str, current_user: dict[str, Any] = Depends(get_current_user)) -> dict[str, Any]:
     joined_now = False
+    cutoff = online_cutoff_iso()
     with get_conn() as conn:
         room = get_room_or_404(conn, room_id)
         cursor = conn.execute(
@@ -500,12 +601,21 @@ async def join_room(room_id: str, current_user: dict[str, Any] = Depends(get_cur
                 r.created_at,
                 owner.username AS owner_username,
                 owner.display_name AS owner_display_name,
-                (SELECT COUNT(*) FROM room_members rm2 WHERE rm2.room_id = r.id) AS member_count
+                (SELECT COUNT(*) FROM room_members rm2 WHERE rm2.room_id = r.id) AS member_count,
+                (
+                    SELECT COUNT(*)
+                    FROM room_members rm3
+                    JOIN users u3 ON u3.id = rm3.user_id
+                    WHERE rm3.room_id = r.id
+                      AND u3.is_online = 1
+                      AND u3.last_seen_at IS NOT NULL
+                      AND u3.last_seen_at >= ?
+                ) AS online_member_count
             FROM rooms r
             JOIN users owner ON owner.id = r.owner_id
             WHERE r.id = ?
             """,
-            (room["id"],),
+            (cutoff, room["id"]),
         ).fetchone()
 
     if joined_now:
@@ -523,6 +633,7 @@ async def join_room(room_id: str, current_user: dict[str, Any] = Depends(get_cur
             ),
             skip_user_id=current_user["id"],
         )
+        await manager.broadcast_online_count(room_id)
 
     return {
         "room": {
@@ -532,6 +643,7 @@ async def join_room(room_id: str, current_user: dict[str, Any] = Depends(get_cur
             "owner_username": row["owner_username"],
             "owner_display_name": row["owner_display_name"],
             "member_count": row["member_count"],
+            "online_member_count": row["online_member_count"],
             "is_owner": row["owner_id"] == current_user["id"],
             "created_at": row["created_at"],
         }
@@ -571,7 +683,7 @@ async def leave_room(room_id: str, current_user: dict[str, Any] = Depends(get_cu
         if room["owner_id"] == current_user["id"]:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Room owner cannot leave. Delete the room instead.",
+                detail="Owner must transfer ownership first, then leave.",
             )
 
         membership = conn.execute(
@@ -606,11 +718,155 @@ async def leave_room(room_id: str, current_user: dict[str, Any] = Depends(get_cu
             }
         ),
     )
+    await manager.broadcast_online_count(room_id)
     return {"message": "Left room successfully"}
+
+
+@app.post("/rooms/{room_id}/remove-member")
+async def remove_member_from_room(
+    room_id: str,
+    payload: RoomMemberMutationRequest,
+    current_user: dict[str, Any] = Depends(get_current_user),
+) -> dict[str, Any]:
+    if payload.user_id == current_user["id"]:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Owner cannot remove themselves")
+
+    with get_conn() as conn:
+        room = get_room_or_404(conn, room_id)
+        if room["owner_id"] != current_user["id"]:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Only owner can remove members")
+
+        member = conn.execute(
+            "SELECT id, username, display_name FROM users WHERE id = ?",
+            (payload.user_id,),
+        ).fetchone()
+        if member is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Member not found")
+        if int(member["id"]) == int(room["owner_id"]):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Cannot remove room owner")
+
+        membership = conn.execute(
+            "SELECT 1 FROM room_members WHERE room_id = ? AND user_id = ?",
+            (room_id, payload.user_id),
+        ).fetchone()
+        if membership is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User is not a room member")
+
+        conn.execute(
+            "DELETE FROM room_members WHERE room_id = ? AND user_id = ?",
+            (room_id, payload.user_id),
+        )
+
+    await manager.close_user_socket(
+        room_id,
+        payload.user_id,
+        code=4003,
+        reason="Removed by room owner",
+    )
+    await manager.broadcast_room(
+        room_id,
+        json.dumps(
+            {
+                "type": "member_left",
+                "roomId": room_id,
+                "senderId": int(member["id"]),
+                "sender": member["display_name"],
+                "senderUsername": member["username"],
+                "removedById": current_user["id"],
+                "removedBy": current_user["display_name"],
+                "sentAt": now_iso(),
+            }
+        ),
+    )
+    await manager.broadcast_online_count(room_id)
+    return {"message": "Member removed"}
+
+
+@app.post("/rooms/{room_id}/owner-leave")
+async def owner_transfer_and_leave(
+    room_id: str,
+    payload: OwnerLeaveRequest,
+    current_user: dict[str, Any] = Depends(get_current_user),
+) -> dict[str, Any]:
+    with get_conn() as conn:
+        room = get_room_or_404(conn, room_id)
+        if room["owner_id"] != current_user["id"]:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Only owner can perform this action")
+        if payload.new_owner_id == current_user["id"]:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Select a different member as owner")
+
+        other_member_exists = conn.execute(
+            "SELECT 1 FROM room_members WHERE room_id = ? AND user_id != ? LIMIT 1",
+            (room_id, current_user["id"]),
+        ).fetchone()
+        if other_member_exists is None:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Owner cannot leave because no other member exists in this room.",
+            )
+
+        candidate = conn.execute(
+            """
+            SELECT u.id, u.username, u.display_name
+            FROM room_members rm
+            JOIN users u ON u.id = rm.user_id
+            WHERE rm.room_id = ? AND rm.user_id = ?
+            """,
+            (room_id, payload.new_owner_id),
+        ).fetchone()
+        if candidate is None:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Selected user is not in this room")
+
+        conn.execute(
+            "UPDATE rooms SET owner_id = ? WHERE id = ?",
+            (payload.new_owner_id, room_id),
+        )
+        conn.execute(
+            "DELETE FROM room_members WHERE room_id = ? AND user_id = ?",
+            (room_id, current_user["id"]),
+        )
+
+    await manager.close_user_socket(
+        room_id,
+        current_user["id"],
+        code=4002,
+        reason="Ownership transferred and room left",
+    )
+    await manager.broadcast_room(
+        room_id,
+        json.dumps(
+            {
+                "type": "owner_transferred",
+                "roomId": room_id,
+                "previousOwnerId": current_user["id"],
+                "previousOwner": current_user["display_name"],
+                "newOwnerId": int(candidate["id"]),
+                "newOwner": candidate["display_name"],
+                "newOwnerUsername": candidate["username"],
+                "sentAt": now_iso(),
+            }
+        ),
+    )
+    await manager.broadcast_room(
+        room_id,
+        json.dumps(
+            {
+                "type": "member_left",
+                "roomId": room_id,
+                "senderId": current_user["id"],
+                "sender": current_user["display_name"],
+                "senderUsername": current_user["username"],
+                "sentAt": now_iso(),
+            }
+        ),
+    )
+    await manager.broadcast_online_count(room_id)
+    return {"message": "Ownership transferred and owner left the room"}
 
 
 @app.get("/rooms/{room_id}/members")
 async def list_room_members(room_id: str, current_user: dict[str, Any] = Depends(get_current_user)) -> dict[str, Any]:
+    cutoff = online_cutoff_iso()
     with get_conn() as conn:
         get_room_or_404(conn, room_id)
         ensure_room_member(conn, room_id, current_user["id"])
@@ -621,6 +877,8 @@ async def list_room_members(room_id: str, current_user: dict[str, Any] = Depends
                 u.username,
                 u.display_name,
                 u.public_key,
+                u.is_online,
+                u.last_seen_at,
                 rm.joined_at
             FROM room_members rm
             JOIN users u ON u.id = rm.user_id
@@ -636,6 +894,7 @@ async def list_room_members(room_id: str, current_user: dict[str, Any] = Depends
             "username": row["username"],
             "display_name": row["display_name"],
             "public_key": row["public_key"],
+            "is_online": bool(row["is_online"]) and bool(row["last_seen_at"]) and row["last_seen_at"] >= cutoff,
             "joined_at": row["joined_at"],
         }
         for row in rows
@@ -663,6 +922,8 @@ async def list_room_messages(
                 SELECT
                     m.id,
                     m.payload,
+                    m.is_deleted,
+                    m.deleted_at,
                     m.created_at,
                     u.id AS sender_id,
                     u.username AS sender_username,
@@ -680,7 +941,20 @@ async def list_room_messages(
 
     messages = []
     for row in rows:
-        payload = parse_json_text(row["payload"])
+        if int(row["is_deleted"]):
+            payload = {
+                "type": "message_deleted",
+                "roomId": room_id,
+                "messageId": row["id"],
+                "senderId": row["sender_id"],
+                "sender": row["sender_display_name"],
+                "senderUsername": row["sender_username"],
+                "sentAt": row["deleted_at"] or row["created_at"],
+            }
+        else:
+            payload = parse_json_text(row["payload"])
+            if isinstance(payload, dict) and payload.get("type") == "chat" and payload.get("messageId") is None:
+                payload["messageId"] = row["id"]
         messages.append(
             {
                 "id": row["id"],
@@ -696,6 +970,54 @@ async def list_room_messages(
         )
 
     return {"messages": messages}
+
+
+@app.post("/rooms/{room_id}/messages/{message_id}/delete")
+async def delete_own_message(
+    room_id: str,
+    message_id: int,
+    current_user: dict[str, Any] = Depends(get_current_user),
+) -> dict[str, Any]:
+    deleted_at = now_iso()
+    with get_conn() as conn:
+        get_room_or_404(conn, room_id)
+        ensure_room_member(conn, room_id, current_user["id"])
+        row = conn.execute(
+            """
+            SELECT m.id, m.sender_id, m.is_deleted, u.username AS sender_username, u.display_name AS sender_name
+            FROM messages m
+            JOIN users u ON u.id = m.sender_id
+            WHERE m.id = ? AND m.room_id = ?
+            """,
+            (message_id, room_id),
+        ).fetchone()
+        if row is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Message not found")
+        if int(row["sender_id"]) != int(current_user["id"]):
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="You can only delete your own messages")
+        if int(row["is_deleted"]):
+            return {"message": "Message already deleted"}
+
+        conn.execute(
+            "UPDATE messages SET is_deleted = 1, deleted_at = ? WHERE id = ?",
+            (deleted_at, message_id),
+        )
+
+    await manager.broadcast_room(
+        room_id,
+        json.dumps(
+            {
+                "type": "message_deleted",
+                "roomId": room_id,
+                "messageId": message_id,
+                "senderId": current_user["id"],
+                "sender": row["sender_name"],
+                "senderUsername": row["sender_username"],
+                "sentAt": deleted_at,
+            }
+        ),
+    )
+    return {"message": "Message deleted"}
 
 
 @app.post("/ftp/upload-placeholder")
@@ -814,9 +1136,12 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, token: str | No
     sender_username = user_row["username"]
     connected = False
     try:
+        set_user_presence(user_id, online=True)
+        await manager.broadcast_presence_for_user(user_id)
         await manager.connect(room_id, user_id, websocket)
         connected = True
         await manager.broadcast_online_count(room_id)
+        room_online_count = manager.room_online_count(room_id)
 
         await websocket.send_text(
             json.dumps(
@@ -825,8 +1150,8 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, token: str | No
                     "roomId": room_id,
                     "senderId": 0,
                     "sender": "server",
-                    "onlineCount": manager.room_client_count(room_id),
-                    "peerOnlineCount": max(manager.room_client_count(room_id) - 1, 0),
+                    "onlineCount": room_online_count,
+                    "peerOnlineCount": max(room_online_count - 1, 0),
                     "sentAt": now_iso(),
                 }
             )
@@ -855,17 +1180,19 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, token: str | No
                         (normalized_packet["publicKey"], user_id),
                     )
 
-            serialized_packet = json.dumps(normalized_packet, separators=(",", ":"))
-
             if normalized_packet["type"] == "chat":
                 with get_conn() as conn:
-                    conn.execute(
+                    serialized_packet_for_storage = json.dumps(normalized_packet, separators=(",", ":"))
+                    cursor = conn.execute(
                         """
                         INSERT INTO messages (room_id, sender_id, payload, created_at)
                         VALUES (?, ?, ?, ?)
                         """,
-                        (room_id, user_id, serialized_packet, normalized_packet["sentAt"]),
+                        (room_id, user_id, serialized_packet_for_storage, normalized_packet["sentAt"]),
                     )
+                    normalized_packet["messageId"] = int(cursor.lastrowid)
+
+            serialized_packet = json.dumps(normalized_packet, separators=(",", ":"))
 
             await manager.broadcast_room(room_id, serialized_packet)
 

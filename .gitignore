@@ -10,3 +10,6 @@ frontend/dist/
 
 .DS_Store
 Thumbs.db
+
+backend/certs
+frontend/certs

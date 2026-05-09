@@ -9,9 +9,12 @@ This project is now an authenticated, multi-room chat portal with persistent roo
 - Room dashboard:
   - Create room (creator becomes owner)
   - Join room by room ID
+  - Transfer ownership and leave (owner flow)
+  - Owner can remove members
   - Delete room (owner only)
 - Room-based WebSocket chat (`/ws/{room_id}`)
 - Persistent message history in database (stored as encrypted packet payloads)
+- Sender-side message deletion (renders "This message was deleted")
 - E2EE retained:
   - Backend never decrypts ciphertext
   - Frontend encrypts before send and decrypts after receive
@@ -96,6 +99,8 @@ Note: frontend now includes a `node-forge` fallback for browser environments whe
 - `POST /auth/register`
 - `POST /auth/login`
 - `GET /auth/me`
+- `POST /auth/ping` (heartbeat to keep online presence fresh)
+- `POST /auth/logout`
 - `PUT /auth/public-key`
 
 ### Rooms
@@ -103,9 +108,12 @@ Note: frontend now includes a `node-forge` fallback for browser environments whe
 - `POST /rooms`
 - `POST /rooms/{room_id}/join`
 - `POST /rooms/{room_id}/leave` (non-owner members only)
+- `POST /rooms/{room_id}/owner-leave` (owner transfers ownership, then leaves)
+- `POST /rooms/{room_id}/remove-member` (owner removes a member)
 - `DELETE /rooms/{room_id}` (owner only)
 - `GET /rooms/{room_id}/members`
 - `GET /rooms/{room_id}/messages?limit=200`
+- `POST /rooms/{room_id}/messages/{message_id}/delete` (sender deletes their own message)
 
 ### FTP Placeholder
 - `POST /ftp/upload-placeholder` (returns 501 until FTP backend is integrated)
@@ -125,7 +133,14 @@ Note: frontend now includes a `node-forge` fallback for browser environments whe
 
 Message history is scoped to each member's join time, so newly added members do not receive old unreadable encrypted backlog from before they joined.
 
+Online status is presence-based (heartbeat + timeout), not room-tab-based. This means room online counts reflect members currently online in the app, even if they are on dashboard and not currently inside that specific room view.
+
 ## Important Security Note
 
 E2EE is implemented at application level.  
 For transport security in deployment, switch to HTTPS/WSS (TLS) with proper certificates.
+
+## Database Note (SQLite in Production)
+
+SQLite works well for single-server deployments and small-to-medium traffic. It is not ideal for multi-instance/cloud autoscaling setups because it is file-based and not designed for many concurrent writers across distributed nodes.  
+For production at larger scale, migrate to PostgreSQL (or similar server database) while keeping the same API/application flow.
