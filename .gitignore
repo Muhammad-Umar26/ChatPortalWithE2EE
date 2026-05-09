@@ -13,3 +13,8 @@ Thumbs.db
 
 backend/certs
 frontend/certs
+
+# Environment variables
+.env
+.env.local
+.env.*.local
