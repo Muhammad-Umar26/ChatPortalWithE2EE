@@ -1,6 +1,6 @@
 # Chat Portal (FastAPI + React + E2EE)
 
-This project is now an authenticated, multi-room chat portal with persistent room/message records and frontend end-to-end encryption.
+This project is now an authenticated, multi-room chat portal with persistent room/message records, frontend end-to-end encryption, and distributed FTPS-backed file storage.
 
 ## Features Implemented
 
@@ -18,9 +18,12 @@ This project is now an authenticated, multi-room chat portal with persistent roo
 - E2EE retained:
   - Backend never decrypts ciphertext
   - Frontend encrypts before send and decrypts after receive
-- FTP integration placeholders:
-  - Backend endpoint for upload metadata (returns 501 for now)
-  - Frontend file-attach UX + placeholder broadcast
+- Distributed encrypted file sharing:
+  - 3 local FTPS servers on ports `2121`, `2122`, `2123`
+  - File chunks are split across separate FTP server directories
+  - File metadata and chunk location are tracked in SQLite
+  - File messages render as clickable downloads in the chat UI
+- Room history is filtered by join time so new members only see messages sent after they joined
 
 ## Project Structure
 
@@ -30,6 +33,8 @@ Project/
     main.py
     requirements.txt
     chat_portal.db              # Auto-created on first backend run
+    ftp_servers.py               # Launches the 3 local FTPS storage servers
+    ftp_data/                    # Local chunk storage, one directory per FTP server
   frontend/
     index.html
     package.json
@@ -50,10 +55,22 @@ cd backend
 python -m venv .venv
 .venv\Scripts\activate
 pip install -r requirements.txt
-uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+python ftp_servers.py
+
+uvicorn main:app --host 0.0.0.0 --port 8000 --reload --ssl-keyfile .\certs\localhost-key.pem --ssl-certfile .\certs\localhost.pem
 ```
 
 Health: `GET http://localhost:8000/health`
+
+### FTPS storage servers
+
+The file storage layer is now a separate FTPS process started with `python ftp_servers.py` from the `backend` folder.
+
+- Server 1: `0.0.0.0:2121`
+- Server 2: `0.0.0.0:2122`
+- Server 3: `0.0.0.0:2123`
+
+Each server writes to its own local directory under `backend/ftp_data/` and uses passive mode with TLS.
 
 ### Backend network/CORS configuration (important for LAN access)
 
@@ -83,6 +100,8 @@ The app now auto-detects host from browser URL and targets:
 - API: `http(s)://<current-host>:8000`
 - WS: `ws(s)://<current-host>:8000/ws`
 
+If you run the backend with the local TLS certs, the browser should be opened over `https://` so the frontend uses secure `https`/`wss` connections.
+
 You can override with Vite env variables:
 
 ```bash
@@ -92,6 +111,18 @@ VITE_WS_BASE_URL=ws://192.168.100.20:8000/ws
 ```
 
 Note: frontend now includes a `node-forge` fallback for browser environments where `window.crypto.subtle` is unavailable (commonly non-HTTPS LAN contexts). Run `npm install` after pulling latest changes.
+
+## File Sharing Flow
+
+1. The sender selects a file in the React frontend.
+2. The frontend creates a fresh AES-GCM key for that file and encrypts the file bytes in the browser.
+3. The AES key is wrapped per recipient using each recipient's RSA public key.
+4. The encrypted file is uploaded to `POST /ftp/upload`.
+5. The backend splits the encrypted file into chunks and stores them across the 3 FTPS servers.
+6. The backend records chunk metadata in SQLite.
+7. Recipients click the file message in chat, download the encrypted file from `GET /ftp/download/{file_id}`, then decrypt it locally in the browser.
+
+This means the file itself is encrypted before it leaves the sender's browser, stays encrypted while stored on the FTPS servers, and is only decrypted on the receiving browser.
 
 ## Core API Endpoints
 
@@ -116,7 +147,8 @@ Note: frontend now includes a `node-forge` fallback for browser environments whe
 - `POST /rooms/{room_id}/messages/{message_id}/delete` (sender deletes their own message)
 
 ### FTP Placeholder
-- `POST /ftp/upload-placeholder` (returns 501 until FTP backend is integrated)
+- `POST /ftp/upload` (accepts an already encrypted file, stores chunks on distributed FTPS servers)
+- `GET /ftp/download/{file_id}` (reassembles encrypted chunks from FTPS and streams the encrypted file back to the client)
 
 ### WebSocket
 - `GET ws://localhost:8000/ws/{room_id}?token=<access_token>`
@@ -132,6 +164,15 @@ Note: frontend now includes a `node-forge` fallback for browser environments whe
 7. Recipient decrypts wrapped AES key with private RSA key, then decrypts ciphertext locally.
 
 Message history is scoped to each member's join time, so newly added members do not receive old unreadable encrypted backlog from before they joined.
+
+File encryption uses the same browser-side pattern at a higher level:
+
+- Text messages are encrypted in the frontend with AES-GCM, and the AES key is wrapped with RSA per recipient.
+- Files are also encrypted in the frontend with AES-GCM before upload.
+- The backend only stores and serves encrypted file chunks; it does not decrypt the file contents.
+- Recipients decrypt the wrapped AES key in the browser, download the encrypted file, and decrypt it locally with the same AES key.
+
+So yes, the files are encrypted too, and the encryption model is intentionally similar to text messages: browser-side AES-GCM plus RSA-wrapped AES keys per recipient.
 
 Online status is presence-based (heartbeat + timeout), not room-tab-based. This means room online counts reflect members currently online in the app, even if they are on dashboard and not currently inside that specific room view.
 

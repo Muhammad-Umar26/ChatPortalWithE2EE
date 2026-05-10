@@ -1,7 +1,9 @@
 import { useEffect, useMemo, useRef, useState } from "react"
 import {
   aesDecrypt,
+  aesDecryptBytes,
   aesEncrypt,
+  aesEncryptBytes,
   decryptWithPrivateKey,
   encryptWithPublicKey,
   exportAesRawToBase64,
@@ -173,6 +175,7 @@ function App() {
   const [messageInput, setMessageInput] = useState("")
   const [emojiOpen, setEmojiOpen] = useState(false)
   const [ownerLeaveTargetId, setOwnerLeaveTargetId] = useState("")
+  const [downloadingFileIds, setDownloadingFileIds] = useState({})
 
   const wsRef = useRef(null)
   const reconnectTimerRef = useRef(null)
@@ -291,7 +294,8 @@ function App() {
 
   async function apiRequest(path, { method = "GET", body, authToken = token } = {}) {
     const headers = {}
-    if (body) headers["Content-Type"] = "application/json"
+    const isFormData = typeof FormData !== "undefined" && body instanceof FormData
+    if (body && !isFormData) headers["Content-Type"] = "application/json"
     if (authToken) headers.Authorization = `Bearer ${authToken}`
 
     let response
@@ -299,7 +303,7 @@ function App() {
       response = await fetch(`${API_BASE_URL}${path}`, {
         method,
         headers,
-        body: body ? JSON.stringify(body) : undefined
+        body: body ? (isFormData ? body : JSON.stringify(body)) : undefined
       })
     } catch {
       throw new Error(
@@ -318,6 +322,35 @@ function App() {
     }
 
     return data
+  }
+
+  async function apiDownloadBinary(path, { authToken = token } = {}) {
+    const headers = {}
+    if (authToken) headers.Authorization = `Bearer ${authToken}`
+
+    let response
+    try {
+      response = await fetch(`${API_BASE_URL}${path}`, {
+        method: "GET",
+        headers
+      })
+    } catch {
+      throw new Error(`Cannot reach backend at ${API_BASE_URL} to download file`)
+    }
+
+    if (!response.ok) {
+      let detail = `Request failed (${response.status})`
+      try {
+        const maybeJson = await response.json()
+        if (maybeJson?.detail) detail = maybeJson.detail
+      } catch {
+        // Ignore parsing fallback.
+      }
+      throw new Error(detail)
+    }
+
+    const binary = await response.arrayBuffer()
+    return new Uint8Array(binary)
   }
 
   async function ensureUserKeys(authToken, authUser) {
@@ -524,6 +557,42 @@ function App() {
         timestamp,
         type: decryptFailed ? "error" : "chat",
         own: senderId === user?.id
+      }
+    }
+
+    if (packet.type === "file_shared") {
+      const senderId = Number(packet.senderId ?? fallbackMeta?.sender?.id ?? 0)
+      const senderName =
+        packet.sender ||
+        fallbackMeta?.sender?.display_name ||
+        fallbackMeta?.sender?.username ||
+        "Unknown"
+      const senderUsername = packet.senderUsername || fallbackMeta?.sender?.username || ""
+      const resolvedMessageId = Number(packet.messageId ?? fallbackMeta.id ?? 0) || null
+      const fileId = Number(packet.fileId ?? 0)
+      if (!fileId) {
+        return null
+      }
+      return {
+        id: resolvedMessageId ? `msg-${resolvedMessageId}` : `file-${fileId}-${Date.now()}-${Math.random()}`,
+        messageId: resolvedMessageId,
+        senderId,
+        sender:
+          senderId === user?.id
+            ? "You"
+            : senderUsername
+              ? `${senderName} (@${senderUsername})`
+              : senderName,
+        content: `Shared encrypted file: ${packet.fileName || "file"}`,
+        timestamp: packet.sentAt || fallbackMeta.created_at || new Date().toISOString(),
+        type: "file",
+        own: senderId === user?.id,
+        fileId,
+        fileName: packet.fileName || "encrypted-file.bin",
+        fileType: packet.fileType || "application/octet-stream",
+        fileSize: Number(packet.fileSize || 0),
+        fileIv: packet.iv || "",
+        encryptedKeys: packet.encryptedKeys || {}
       }
     }
 
@@ -1029,6 +1098,53 @@ function App() {
     }
   }
 
+  async function downloadSharedFile(message) {
+    if (!message?.fileId || !message?.fileIv) {
+      setBanner("Invalid file metadata. Please ask sender to share again.")
+      return
+    }
+    if (!keyPairRef.current?.privateKey) {
+      setBanner("Your private key is unavailable on this browser. Cannot decrypt file.")
+      return
+    }
+
+    const wrappedAesKey =
+      message?.encryptedKeys?.[String(user?.id)] ?? message?.encryptedKeys?.[user?.id] ?? null
+    if (!wrappedAesKey) {
+      setBanner("This encrypted file is not available for your current key.")
+      return
+    }
+
+    setBanner("")
+    setDownloadingFileIds((prev) => ({ ...prev, [message.fileId]: true }))
+    try {
+      const aesRawBase64 = await decryptWithPrivateKey(keyPairRef.current.privateKey, wrappedAesKey)
+      const aesKey = await importAesRawFromBase64(aesRawBase64)
+      const encryptedBytes = await apiDownloadBinary(`/ftp/download/${message.fileId}`)
+      const decryptedBytes = await aesDecryptBytes(aesKey, message.fileIv, encryptedBytes)
+
+      const fileName = message.fileName || `file-${message.fileId}`
+      const mimeType = message.fileType || "application/octet-stream"
+      const blob = new Blob([decryptedBytes], { type: mimeType })
+      const blobUrl = URL.createObjectURL(blob)
+      const anchor = document.createElement("a")
+      anchor.href = blobUrl
+      anchor.download = fileName
+      document.body.appendChild(anchor)
+      anchor.click()
+      anchor.remove()
+      URL.revokeObjectURL(blobUrl)
+    } catch (error) {
+      setBanner(`File download/decryption failed: ${buildErrorMessage(error)}`)
+    } finally {
+      setDownloadingFileIds((prev) => {
+        const next = { ...prev }
+        delete next[message.fileId]
+        return next
+      })
+    }
+  }
+
   async function sendMessage() {
     const plaintext = messageInput.trim()
     if (!plaintext || !activeRoom || !user) return
@@ -1092,33 +1208,63 @@ function App() {
   async function handleFilePicked(event) {
     const file = event.target.files?.[0]
     event.target.value = ""
-    if (!file || !activeRoom) return
+    if (!file || !activeRoom || !user) return
 
-    try {
-      await apiRequest("/ftp/upload-placeholder", {
-        method: "POST",
-        body: {
-          room_id: activeRoom.id,
-          file_name: file.name,
-          file_size: file.size,
-          content_type: file.type || "application/octet-stream"
-        }
-      })
-    } catch (error) {
-      appendSystemMessage(`FTP module placeholder: ${buildErrorMessage(error)}`)
+    const socket = wsRef.current
+    if (!socket || socket.readyState !== WebSocket.OPEN) {
+      setBanner("WebSocket is disconnected. Reconnect to share files securely.")
+      return
     }
 
-    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-      wsRef.current.send(
+    try {
+      const recipientKeyMap = new Map(memberPublicKeysRef.current)
+      if (publicKeyBase64Ref.current) {
+        recipientKeyMap.set(String(user.id), publicKeyBase64Ref.current)
+      }
+      if (recipientKeyMap.size === 0) {
+        setBanner("No recipient public keys available in this room yet.")
+        return
+      }
+
+      const aesKey = await generateAesKey()
+      const aesRawBase64 = await exportAesRawToBase64(aesKey)
+      const encryptedKeys = {}
+      for (const [recipientId, recipientPublicKeyBase64] of recipientKeyMap.entries()) {
+        const recipientPublicKey = await importPublicKeyFromBase64(recipientPublicKeyBase64)
+        encryptedKeys[recipientId] = await encryptWithPublicKey(recipientPublicKey, aesRawBase64)
+      }
+
+      const rawBytes = new Uint8Array(await file.arrayBuffer())
+      const { iv, ciphertextBytes } = await aesEncryptBytes(aesKey, rawBytes)
+
+      const formData = new FormData()
+      formData.append("room_id", activeRoom.id)
+      formData.append(
+        "file",
+        new File([ciphertextBytes], `${file.name}.enc`, {
+          type: "application/octet-stream"
+        })
+      )
+      const uploadResponse = await apiRequest("/ftp/upload", {
+        method: "POST",
+        body: formData
+      })
+
+      socket.send(
         JSON.stringify({
-          type: "file-intent",
+          type: "file_shared",
           roomId: activeRoom.id,
+          fileId: Number(uploadResponse.file_id),
           fileName: file.name,
           fileSize: file.size,
-          contentType: file.type || "application/octet-stream",
+          fileType: file.type || "application/octet-stream",
+          encryptedKeys,
+          iv,
           sentAt: new Date().toISOString()
         })
       )
+    } catch (error) {
+      appendSystemMessage(`File share failed: ${buildErrorMessage(error)}`)
     }
   }
 
@@ -1499,7 +1645,9 @@ function App() {
                 key={message.id}
                 className={`message ${message.own ? "outgoing" : "incoming"} ${
                   message.type === "system" ? "system" : ""
-                } ${message.type === "error" ? "error" : ""} ${message.type === "deleted" ? "deleted" : ""}`}
+                } ${message.type === "error" ? "error" : ""} ${message.type === "deleted" ? "deleted" : ""} ${
+                  message.type === "file" ? "file-message" : ""
+                }`}
               >
                 <div className="message-head">
                   <strong>{message.sender}</strong>
@@ -1515,7 +1663,26 @@ function App() {
                     )}
                   </div>
                 </div>
-                <p>{message.content}</p>
+                {message.type === "file" ? (
+                  <div className="file-container">
+                    <div className="file-info">
+                      <span className="file-icon">📎</span>
+                      <div className="file-details">
+                        <p className="file-name">{message.fileName}</p>
+                        <p className="file-size">{(message.fileSize / 1024).toFixed(1)} KB</p>
+                      </div>
+                    </div>
+                    <button
+                      className={`file-download-btn ${downloadingFileIds[message.fileId] ? "loading" : ""}`}
+                      onClick={() => void downloadSharedFile(message)}
+                      disabled={downloadingFileIds[message.fileId]}
+                    >
+                      {downloadingFileIds[message.fileId] ? "Downloading..." : "Download"}
+                    </button>
+                  </div>
+                ) : (
+                  <p>{message.content}</p>
+                )}
               </article>
             ))
           )}

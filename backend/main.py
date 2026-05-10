@@ -9,20 +9,24 @@ Security model:
 from __future__ import annotations
 
 import base64
+import io
 import hashlib
 import hmac
 import json
 import logging
 import os
 import secrets
+import ssl
 import sqlite3
 import time
 import uuid
+from ftplib import FTP_TLS, error_perm
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from fastapi import Depends, FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect, status
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, UploadFile, WebSocket, WebSocketDisconnect, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
 
@@ -35,6 +39,16 @@ DB_PATH = os.path.join(APP_DIR, "chat_portal.db")
 TOKEN_SECRET = os.getenv("CHAT_TOKEN_SECRET", "replace-this-in-production")
 TOKEN_TTL_SECONDS = 7 * 24 * 60 * 60
 ONLINE_WINDOW_SECONDS = int(os.getenv("ONLINE_WINDOW_SECONDS", "90"))
+FTPS_USERNAME = os.getenv("FTPS_USERNAME", "ftpuser")
+FTPS_PASSWORD = os.getenv("FTPS_PASSWORD", "ftppass")
+FTPS_HOST = os.getenv("FTPS_HOST", "127.0.0.1")
+FTPS_CHUNK_SIZE_BYTES = 1 * 1024 * 1024
+FTPS_CONNECT_TIMEOUT_SECONDS = int(os.getenv("FTPS_CONNECT_TIMEOUT_SECONDS", "20"))
+FTPS_SERVERS = [
+    {"host": FTPS_HOST, "port": 2121},
+    {"host": FTPS_HOST, "port": 2122},
+    {"host": FTPS_HOST, "port": 2123},
+]
 DEFAULT_CORS_ORIGINS = ["http://localhost:5173", "http://127.0.0.1:5173"]
 ENV_CORS_ORIGINS = [value.strip() for value in os.getenv("CORS_ALLOW_ORIGINS", "").split(",") if value.strip()]
 CORS_ALLOW_ORIGIN_REGEX = os.getenv(
@@ -115,7 +129,35 @@ def init_db() -> None:
                 FOREIGN KEY (sender_id) REFERENCES users(id) ON DELETE CASCADE
             );
 
+            CREATE TABLE IF NOT EXISTS files (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                message_id INTEGER,
+                room_id TEXT NOT NULL,
+                uploader_id INTEGER NOT NULL,
+                filename TEXT NOT NULL,
+                mime_type TEXT,
+                byte_size INTEGER NOT NULL DEFAULT 0,
+                total_chunks INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (message_id) REFERENCES messages(id) ON DELETE SET NULL,
+                FOREIGN KEY (room_id) REFERENCES rooms(id) ON DELETE CASCADE,
+                FOREIGN KEY (uploader_id) REFERENCES users(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS file_chunks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                file_id INTEGER NOT NULL,
+                chunk_index INTEGER NOT NULL,
+                ftp_server_ip TEXT NOT NULL,
+                ftp_server_port INTEGER NOT NULL,
+                remote_path TEXT NOT NULL,
+                FOREIGN KEY (file_id) REFERENCES files(id) ON DELETE CASCADE,
+                UNIQUE(file_id, chunk_index)
+            );
+
             CREATE INDEX IF NOT EXISTS idx_messages_room_id ON messages(room_id, id);
+            CREATE INDEX IF NOT EXISTS idx_files_room_id ON files(room_id, id);
+            CREATE INDEX IF NOT EXISTS idx_file_chunks_file_id ON file_chunks(file_id, chunk_index);
             """
         )
         columns = {row["name"] for row in conn.execute("PRAGMA table_info(users)").fetchall()}
@@ -128,6 +170,17 @@ def init_db() -> None:
             conn.execute("ALTER TABLE messages ADD COLUMN is_deleted INTEGER NOT NULL DEFAULT 0")
         if "deleted_at" not in message_columns:
             conn.execute("ALTER TABLE messages ADD COLUMN deleted_at TEXT")
+        file_columns = {row["name"] for row in conn.execute("PRAGMA table_info(files)").fetchall()}
+        if file_columns and "room_id" not in file_columns:
+            conn.execute("ALTER TABLE files ADD COLUMN room_id TEXT")
+        if file_columns and "uploader_id" not in file_columns:
+            conn.execute("ALTER TABLE files ADD COLUMN uploader_id INTEGER")
+        if file_columns and "mime_type" not in file_columns:
+            conn.execute("ALTER TABLE files ADD COLUMN mime_type TEXT")
+        if file_columns and "byte_size" not in file_columns:
+            conn.execute("ALTER TABLE files ADD COLUMN byte_size INTEGER NOT NULL DEFAULT 0")
+        if file_columns and "created_at" not in file_columns:
+            conn.execute("ALTER TABLE files ADD COLUMN created_at TEXT")
 
 
 def set_user_presence(user_id: int, *, online: bool) -> None:
@@ -237,6 +290,84 @@ def parse_json_text(value: str) -> dict[str, Any] | None:
     return parsed
 
 
+def split_into_chunks(blob: bytes, *, chunk_size: int) -> list[bytes]:
+    if chunk_size <= 0:
+        raise ValueError("chunk_size must be > 0")
+    if len(blob) == 0:
+        return [b""]
+    return [blob[i : i + chunk_size] for i in range(0, len(blob), chunk_size)]
+
+
+def make_ftps_client(host: str, port: int) -> FTP_TLS:
+    ssl_context = ssl.create_default_context()
+    ssl_context.check_hostname = False
+    ssl_context.verify_mode = ssl.CERT_NONE
+
+    ftps = FTP_TLS(context=ssl_context, timeout=FTPS_CONNECT_TIMEOUT_SECONDS)
+    ftps.connect(host=host, port=port, timeout=FTPS_CONNECT_TIMEOUT_SECONDS)
+    ftps.login(user=FTPS_USERNAME, passwd=FTPS_PASSWORD)
+    ftps.prot_p()
+    ftps.set_pasv(True)
+    return ftps
+
+
+def ensure_ftps_directory(ftps: FTP_TLS, directory_path: str) -> None:
+    cleaned = directory_path.strip("/")
+    if not cleaned:
+        return
+
+    current = ""
+    for part in cleaned.split("/"):
+        current = f"{current}/{part}" if current else part
+        try:
+            ftps.mkd(current)
+        except error_perm as exc:
+            if not str(exc).startswith("550"):
+                raise
+
+
+def ftps_upload_chunk(*, host: str, port: int, remote_path: str, chunk_data: bytes) -> None:
+    ftps = make_ftps_client(host, port)
+    try:
+        parent_dir = remote_path.rsplit("/", 1)[0] if "/" in remote_path else ""
+        ensure_ftps_directory(ftps, parent_dir)
+        ftps.storbinary(f"STOR {remote_path}", io.BytesIO(chunk_data))
+    finally:
+        try:
+            ftps.quit()
+        except Exception:
+            ftps.close()
+
+
+def ftps_download_chunk(*, host: str, port: int, remote_path: str) -> bytes:
+    ftps = make_ftps_client(host, port)
+    buffer = io.BytesIO()
+    try:
+        ftps.retrbinary(f"RETR {remote_path}", buffer.write)
+        return buffer.getvalue()
+    finally:
+        try:
+            ftps.quit()
+        except Exception:
+            ftps.close()
+
+
+def ftps_delete_chunk(*, host: str, port: int, remote_path: str) -> None:
+    ftps = make_ftps_client(host, port)
+    try:
+        ftps.delete(remote_path)
+    finally:
+        try:
+            ftps.quit()
+        except Exception:
+            ftps.close()
+
+
+def content_disposition_filename(filename: str) -> str:
+    safe = filename.replace("\\", "_").replace('"', "_").strip()
+    return safe or "encrypted-file.bin"
+
+
 async def get_current_user(
     credentials: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),
 ) -> dict[str, Any]:
@@ -276,13 +407,6 @@ class RoomMemberMutationRequest(BaseModel):
 
 class OwnerLeaveRequest(BaseModel):
     new_owner_id: int = Field(gt=0)
-
-
-class FTPUploadPlaceholderRequest(BaseModel):
-    room_id: str = Field(min_length=4, max_length=64)
-    file_name: str = Field(min_length=1, max_length=255)
-    file_size: int = Field(ge=0)
-    content_type: str | None = Field(default=None, max_length=255)
 
 
 class ConnectionManager:
@@ -911,11 +1035,12 @@ async def list_room_messages(
     with get_conn() as conn:
         get_room_or_404(conn, room_id)
         membership = conn.execute(
-            "SELECT 1 FROM room_members WHERE room_id = ? AND user_id = ?",
+            "SELECT joined_at FROM room_members WHERE room_id = ? AND user_id = ?",
             (room_id, current_user["id"]),
         ).fetchone()
         if membership is None:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="User is not a room member")
+        user_joined_at = membership["joined_at"]
         rows = conn.execute(
             """
             SELECT * FROM (
@@ -930,13 +1055,13 @@ async def list_room_messages(
                     u.display_name AS sender_display_name
                 FROM messages m
                 JOIN users u ON u.id = m.sender_id
-                WHERE m.room_id = ?
+                WHERE m.room_id = ? AND m.created_at >= ?
                 ORDER BY m.id DESC
                 LIMIT ?
             ) recent
             ORDER BY recent.id ASC
             """,
-            (room_id, limit),
+            (room_id, user_joined_at, limit),
         ).fetchall()
 
     messages = []
@@ -1020,21 +1145,153 @@ async def delete_own_message(
     return {"message": "Message deleted"}
 
 
-@app.post("/ftp/upload-placeholder")
-async def ftp_upload_placeholder(
-    payload: FTPUploadPlaceholderRequest,
+@app.post("/ftp/upload")
+async def ftp_upload(
+    room_id: str = Form(..., min_length=4, max_length=64),
+    message_id: int | None = Form(default=None, gt=0),
+    file: UploadFile = File(...),
     current_user: dict[str, Any] = Depends(get_current_user),
 ) -> dict[str, Any]:
     with get_conn() as conn:
-        get_room_or_404(conn, payload.room_id)
-        ensure_room_member(conn, payload.room_id, current_user["id"])
+        get_room_or_404(conn, room_id)
+        ensure_room_member(conn, room_id, current_user["id"])
+        if message_id is not None:
+            msg = conn.execute(
+                "SELECT id FROM messages WHERE id = ? AND room_id = ?",
+                (message_id, room_id),
+            ).fetchone()
+            if msg is None:
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid message_id for this room")
 
-    raise HTTPException(
-        status_code=status.HTTP_501_NOT_IMPLEMENTED,
-        detail=(
-            f"FTP upload integration pending. Received metadata for "
-            f"{payload.file_name} ({payload.file_size} bytes)."
-        ),
+    encrypted_payload = await file.read()
+    if encrypted_payload is None:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Missing upload file")
+
+    chunks = split_into_chunks(encrypted_payload, chunk_size=FTPS_CHUNK_SIZE_BYTES)
+    file_name = file.filename or "encrypted-file.bin"
+    mime_type = file.content_type or "application/octet-stream"
+    created_at = now_iso()
+
+    uploaded_chunks: list[tuple[str, int, str]] = []
+    file_id: int | None = None
+    try:
+        with get_conn() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO files (message_id, room_id, uploader_id, filename, mime_type, byte_size, total_chunks, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    message_id,
+                    room_id,
+                    current_user["id"],
+                    file_name,
+                    mime_type,
+                    len(encrypted_payload),
+                    len(chunks),
+                    created_at,
+                ),
+            )
+            file_id = int(cursor.lastrowid)
+
+        for chunk_index, chunk in enumerate(chunks):
+            server = FTPS_SERVERS[chunk_index % len(FTPS_SERVERS)]
+            remote_path = f"room_{room_id}/file_{file_id}/chunk_{chunk_index:06d}.bin"
+            ftps_upload_chunk(
+                host=server["host"],
+                port=server["port"],
+                remote_path=remote_path,
+                chunk_data=chunk,
+            )
+            uploaded_chunks.append((server["host"], int(server["port"]), remote_path))
+
+        with get_conn() as conn:
+            conn.executemany(
+                """
+                INSERT INTO file_chunks (file_id, chunk_index, ftp_server_ip, ftp_server_port, remote_path)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        file_id,
+                        chunk_index,
+                        FTPS_SERVERS[chunk_index % len(FTPS_SERVERS)]["host"],
+                        FTPS_SERVERS[chunk_index % len(FTPS_SERVERS)]["port"],
+                        f"room_{room_id}/file_{file_id}/chunk_{chunk_index:06d}.bin",
+                    )
+                    for chunk_index in range(len(chunks))
+                ],
+            )
+    except Exception as exc:
+        logger.exception("FTPS upload failed for room=%s user=%s err=%s", room_id, current_user["id"], exc)
+        if file_id is not None:
+            with get_conn() as conn:
+                conn.execute("DELETE FROM files WHERE id = ?", (file_id,))
+        for host, port, remote_path in uploaded_chunks:
+            try:
+                ftps_delete_chunk(host=host, port=port, remote_path=remote_path)
+            except Exception:
+                logger.warning("Rollback could not delete chunk path=%s on %s:%s", remote_path, host, port)
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Encrypted file upload to distributed FTPS storage failed",
+        ) from exc
+
+    return {
+        "file_id": file_id,
+        "room_id": room_id,
+        "filename": file_name,
+        "mime_type": mime_type,
+        "byte_size": len(encrypted_payload),
+        "total_chunks": len(chunks),
+    }
+
+
+@app.get("/ftp/download/{file_id}")
+async def ftp_download(
+    file_id: int,
+    current_user: dict[str, Any] = Depends(get_current_user),
+) -> StreamingResponse:
+    with get_conn() as conn:
+        file_row = conn.execute("SELECT * FROM files WHERE id = ?", (file_id,)).fetchone()
+        if file_row is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="File not found")
+        ensure_room_member(conn, file_row["room_id"], current_user["id"])
+        chunk_rows = conn.execute(
+            """
+            SELECT chunk_index, ftp_server_ip, ftp_server_port, remote_path
+            FROM file_chunks
+            WHERE file_id = ?
+            ORDER BY chunk_index ASC
+            """,
+            (file_id,),
+        ).fetchall()
+
+    if not chunk_rows:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="File chunks not found")
+
+    assembled = io.BytesIO()
+    try:
+        for row in chunk_rows:
+            chunk_data = ftps_download_chunk(
+                host=row["ftp_server_ip"],
+                port=int(row["ftp_server_port"]),
+                remote_path=row["remote_path"],
+            )
+            assembled.write(chunk_data)
+    except Exception as exc:
+        logger.exception("FTPS download failed for file_id=%s err=%s", file_id, exc)
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Unable to download encrypted file from distributed FTPS storage",
+        ) from exc
+
+    assembled.seek(0)
+    download_name = content_disposition_filename(file_row["filename"])
+    return StreamingResponse(
+        assembled,
+        media_type=file_row["mime_type"] or "application/octet-stream",
+        headers={"Content-Disposition": f'attachment; filename="{download_name}"'},
     )
 
 
@@ -1096,6 +1353,38 @@ def normalize_ws_packet(
             "fileName": file_name,
             "fileSize": file_size,
             "contentType": content_type if isinstance(content_type, str) else None,
+            "sentAt": sent_at,
+        }
+
+    if packet_type == "file_shared":
+        file_id = packet.get("fileId")
+        file_name = packet.get("fileName")
+        file_size = packet.get("fileSize")
+        file_type = packet.get("fileType")
+        encrypted_keys = packet.get("encryptedKeys")
+        iv = packet.get("iv")
+        if (
+            not isinstance(file_id, int)
+            or file_id <= 0
+            or not isinstance(file_name, str)
+            or not isinstance(file_size, int)
+            or file_size < 0
+            or not isinstance(encrypted_keys, dict)
+            or not isinstance(iv, str)
+        ):
+            return None
+        return {
+            "type": "file_shared",
+            "roomId": room_id,
+            "senderId": user_id,
+            "sender": sender_name,
+            "senderUsername": sender_username,
+            "fileId": file_id,
+            "fileName": file_name,
+            "fileSize": file_size,
+            "fileType": file_type if isinstance(file_type, str) else "application/octet-stream",
+            "encryptedKeys": encrypted_keys,
+            "iv": iv,
             "sentAt": sent_at,
         }
 
@@ -1180,7 +1469,7 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, token: str | No
                         (normalized_packet["publicKey"], user_id),
                     )
 
-            if normalized_packet["type"] == "chat":
+            if normalized_packet["type"] in {"chat", "file_shared"}:
                 with get_conn() as conn:
                     serialized_packet_for_storage = json.dumps(normalized_packet, separators=(",", ":"))
                     cursor = conn.execute(
@@ -1191,6 +1480,15 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, token: str | No
                         (room_id, user_id, serialized_packet_for_storage, normalized_packet["sentAt"]),
                     )
                     normalized_packet["messageId"] = int(cursor.lastrowid)
+                    if normalized_packet["type"] == "file_shared":
+                        conn.execute(
+                            """
+                            UPDATE files
+                            SET message_id = COALESCE(message_id, ?)
+                            WHERE id = ? AND room_id = ?
+                            """,
+                            (normalized_packet["messageId"], normalized_packet["fileId"], room_id),
+                        )
 
             serialized_packet = json.dumps(normalized_packet, separators=(",", ":"))
 

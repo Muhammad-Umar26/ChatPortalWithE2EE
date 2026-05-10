@@ -634,6 +634,85 @@ button.danger {
   word-break: break-word;
 }
 
+.file-container {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 0;
+}
+
+.file-info {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex: 1;
+  min-width: 0;
+}
+
+.file-icon {
+  font-size: 18px;
+  flex-shrink: 0;
+}
+
+.file-details {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  flex: 1;
+}
+
+.file-name {
+  margin: 0;
+  font-weight: 600;
+  font-size: 13px;
+  color: #1e293b;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.file-size {
+  margin: 0;
+  font-size: 11px;
+  color: #64748b;
+}
+
+.file-download-btn {
+  flex-shrink: 0;
+  padding: 6px 12px;
+  background: #3b82f6;
+  color: white;
+  border: none;
+  border-radius: 6px;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background-color 0.2s ease;
+}
+
+.file-download-btn:hover:not(:disabled) {
+  background: #2563eb;
+}
+
+.file-download-btn:disabled {
+  background: #9ca3af;
+  cursor: not-allowed;
+}
+
+.file-download-btn.loading {
+  opacity: 0.7;
+}
+
+.message.outgoing .file-download-btn {
+  background: #5b7bfa;
+}
+
+.message.outgoing .file-download-btn:hover:not(:disabled) {
+  background: #4f46e5;
+}
+
 .composer {
   display: flex;
   gap: 10px;

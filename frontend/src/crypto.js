@@ -31,6 +31,22 @@ function base64ToArrayBuffer(base64) {
   return bytes.buffer;
 }
 
+function uint8ArrayToBinary(bytes) {
+  let binary = "";
+  for (let i = 0; i < bytes.length; i += 1) {
+    binary += String.fromCharCode(bytes[i]);
+  }
+  return binary;
+}
+
+function binaryToUint8Array(binary) {
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i += 1) {
+    bytes[i] = binary.charCodeAt(i);
+  }
+  return bytes;
+}
+
 function makeFallbackPublicKey(pem) {
   return { __fallback: "forge-public-key", pem };
 }
@@ -279,4 +295,75 @@ export async function aesDecrypt(aesKey, ivBase64, ciphertextBase64) {
     base64ToArrayBuffer(ciphertextBase64)
   );
   return decoder.decode(decrypted);
+}
+
+export async function aesEncryptBytes(aesKey, bytesLike) {
+  const sourceBytes = bytesLike instanceof Uint8Array ? bytesLike : new Uint8Array(bytesLike);
+  if (isFallbackAesKey(aesKey)) {
+    const keyBytes = forge.util.decode64(aesKey.rawBase64);
+    const ivBytes = forge.random.getBytesSync(12);
+
+    const cipher = forge.cipher.createCipher("AES-GCM", keyBytes);
+    cipher.start({ iv: ivBytes, tagLength: 128 });
+    cipher.update(forge.util.createBuffer(uint8ArrayToBinary(sourceBytes)));
+    if (!cipher.finish()) {
+      throw new Error("Failed to encrypt file payload");
+    }
+
+    const combined = cipher.output.getBytes() + cipher.mode.tag.getBytes();
+    return {
+      iv: forge.util.encode64(ivBytes),
+      ciphertextBytes: binaryToUint8Array(combined)
+    };
+  }
+
+  const iv = window.crypto.getRandomValues(new Uint8Array(12));
+  const encrypted = await window.crypto.subtle.encrypt(
+    { name: "AES-GCM", iv },
+    aesKey,
+    sourceBytes
+  );
+  return {
+    iv: arrayBufferToBase64(iv.buffer),
+    ciphertextBytes: new Uint8Array(encrypted)
+  };
+}
+
+export async function aesDecryptBytes(aesKey, ivBase64, encryptedBytesLike) {
+  const encryptedBytes =
+    encryptedBytesLike instanceof Uint8Array ? encryptedBytesLike : new Uint8Array(encryptedBytesLike);
+
+  if (isFallbackAesKey(aesKey)) {
+    const keyBytes = forge.util.decode64(aesKey.rawBase64);
+    const ivBytes = forge.util.decode64(ivBase64);
+    const combinedBytes = uint8ArrayToBinary(encryptedBytes);
+
+    if (combinedBytes.length < 16) {
+      throw new Error("Invalid encrypted file payload");
+    }
+
+    const dataBytes = combinedBytes.slice(0, -16);
+    const tagBytes = combinedBytes.slice(-16);
+
+    const decipher = forge.cipher.createDecipher("AES-GCM", keyBytes);
+    decipher.start({
+      iv: ivBytes,
+      tagLength: 128,
+      tag: forge.util.createBuffer(tagBytes)
+    });
+    decipher.update(forge.util.createBuffer(dataBytes));
+    const success = decipher.finish();
+    if (!success) {
+      throw new Error("Failed to decrypt file payload");
+    }
+    return binaryToUint8Array(decipher.output.getBytes());
+  }
+
+  const iv = new Uint8Array(base64ToArrayBuffer(ivBase64));
+  const decrypted = await window.crypto.subtle.decrypt(
+    { name: "AES-GCM", iv },
+    aesKey,
+    encryptedBytes
+  );
+  return new Uint8Array(decrypted);
 }
