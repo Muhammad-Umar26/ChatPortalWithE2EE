@@ -62,7 +62,7 @@ CORS_ALLOW_ORIGIN_REGEX = os.getenv(
 )
 
 FTPS_HOST = os.getenv("FTPS_HOST", "127.0.0.1")
-FTPS_PORT = int(os.getenv("FTPS_PORT", "2121"))
+FTPS_PORT = int(os.getenv("FTPS_PORT", "8080"))
 FTPS_USER = os.getenv("FTPS_USER", "foo")
 FTPS_PASSWORD = os.getenv("FTPS_PASSWORD", "S3cureP@ssw0rd!")
 FTPS_INSECURE = os.getenv("FTPS_INSECURE", "true").lower() == "true"
