@@ -320,6 +320,36 @@ function App() {
     return data
   }
 
+  async function apiUploadFile(path, { formData, authToken = token } = {}) {
+    const headers = {}
+    if (authToken) headers.Authorization = `Bearer ${authToken}`
+
+    let response
+    try {
+      response = await fetch(`${API_BASE_URL}${path}`, {
+        method: "POST",
+        headers,
+        body: formData
+      })
+    } catch {
+      throw new Error(
+        `Cannot reach backend at ${API_BASE_URL}. Start FastAPI and ensure CORS allows this frontend origin.`
+      )
+    }
+
+    const isJson = (response.headers.get("content-type") || "").includes("application/json")
+    const data = isJson ? await response.json() : null
+
+    if (!response.ok) {
+      const detail = data?.detail || `Request failed (${response.status})`
+      const error = new Error(detail)
+      error.status = response.status
+      throw error
+    }
+
+    return data
+  }
+
   async function ensureUserKeys(authToken, authUser) {
     try {
       const storageKey = `${KEY_STORAGE_PREFIX}:${authUser.id}`
@@ -579,6 +609,27 @@ function App() {
         timestamp: packet.sentAt || new Date().toISOString(),
         type: "system",
         own: false
+      }
+    }
+
+    if (packet.type === "file") {
+      return {
+        id: `file-${packet.fileId || Date.now()}`,
+        messageId: packet.messageId || null,
+        sender: packet.sender || "Unknown",
+        senderId: packet.senderId || 0,
+        content: `${packet.fileName} (${packet.fileSize} bytes)`,
+        timestamp: packet.sentAt || new Date().toISOString(),
+        type: "file",
+        own: packet.senderId === user?.id,
+        file: {
+          roomId: packet.roomId,
+          fileId: packet.fileId,
+          name: packet.fileName,
+          format: packet.format,
+          size: packet.fileSize,
+          contentType: packet.contentType
+        }
       }
     }
 
@@ -1095,30 +1146,59 @@ function App() {
     if (!file || !activeRoom) return
 
     try {
-      await apiRequest("/ftp/upload-placeholder", {
-        method: "POST",
-        body: {
-          room_id: activeRoom.id,
-          file_name: file.name,
-          file_size: file.size,
-          content_type: file.type || "application/octet-stream"
-        }
-      })
-    } catch (error) {
-      appendSystemMessage(`FTP module placeholder: ${buildErrorMessage(error)}`)
-    }
+      const formData = new FormData()
+      formData.append("room_id", activeRoom.id)
+      formData.append("file", file)
 
-    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-      wsRef.current.send(
-        JSON.stringify({
-          type: "file-intent",
-          roomId: activeRoom.id,
-          fileName: file.name,
-          fileSize: file.size,
-          contentType: file.type || "application/octet-stream",
-          sentAt: new Date().toISOString()
-        })
+      const response = await apiUploadFile("/files/upload", { formData })
+      if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+        wsRef.current.send(
+          JSON.stringify({
+            type: "file",
+            roomId: response.room_id,
+            fileId: response.file_id,
+            fileName: response.name,
+            fileSize: response.size,
+            format: response.format,
+            contentType: response.content_type || "application/octet-stream",
+            sentAt: new Date().toISOString()
+          })
+        )
+      }
+    } catch (error) {
+      appendSystemMessage(`File upload failed: ${buildErrorMessage(error)}`)
+    }
+  }
+
+  async function downloadFile(message) {
+    const fileMeta = message?.file
+    if (!fileMeta?.roomId || !fileMeta?.fileId) return
+
+    try {
+      const response = await fetch(
+        `${API_BASE_URL}/files/${encodeURIComponent(fileMeta.roomId)}/${encodeURIComponent(fileMeta.fileId)}`,
+        {
+          method: "GET",
+          headers: token ? { Authorization: `Bearer ${token}` } : {}
+        }
       )
+
+      if (!response.ok) {
+        const detail = await response.text()
+        throw new Error(detail || `Download failed (${response.status})`)
+      }
+
+      const blob = await response.blob()
+      const url = URL.createObjectURL(blob)
+      const anchor = document.createElement("a")
+      anchor.href = url
+      anchor.download = fileMeta.name || "download"
+      document.body.appendChild(anchor)
+      anchor.click()
+      anchor.remove()
+      URL.revokeObjectURL(url)
+    } catch (error) {
+      appendSystemMessage(`File download failed: ${buildErrorMessage(error)}`)
     }
   }
 
@@ -1516,6 +1596,11 @@ function App() {
                   </div>
                 </div>
                 <p>{message.content}</p>
+                {message.type === "file" && message.file?.fileId && (
+                  <button className="secondary" onClick={() => void downloadFile(message)}>
+                    Download file
+                  </button>
+                )}
               </article>
             ))
           )}

@@ -1,0 +1,6 @@
+ftp_servers_path: ./servers.json
+data_dir_path: ./data
+certs_dir_path: ./certs
+max_chunk_size: 5242880
+upload_queue_size: 32
+upload_workers: 1

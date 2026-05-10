@@ -1,0 +1,3 @@
+FROM delfer/alpine-ftp-server
+
+RUN apk add --no-cache netcat-openbsd

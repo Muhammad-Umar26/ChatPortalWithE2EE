@@ -1,0 +1,25 @@
+{
+  "servers": [
+    {
+      "name": "ftps-1",
+      "host": "ftps-1",
+      "port": 21,
+      "username": "foo",
+      "password": "S3cureP@ssw0rd!"
+    },
+    {
+      "name": "ftps-2",
+      "host": "ftps-2",
+      "port": 21,
+      "username": "foo",
+      "password": "S3cureP@ssw0rd!"
+    },
+    {
+      "name": "ftps-3",
+      "host": "ftps-3",
+      "port": 21,
+      "username": "foo",
+      "password": "S3cureP@ssw0rd!"
+    }
+  ]
+}

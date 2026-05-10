@@ -16,14 +16,31 @@ import logging
 import os
 import secrets
 import sqlite3
+import subprocess
+import tempfile
+import threading
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from fastapi import Depends, FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect, status
+from fastapi import (
+    BackgroundTasks,
+    Depends,
+    FastAPI,
+    File,
+    Form,
+    HTTPException,
+    Query,
+    UploadFile,
+    WebSocket,
+    WebSocketDisconnect,
+    status,
+)
+from dotenv import load_dotenv
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 
@@ -31,6 +48,8 @@ logger = logging.getLogger("chat-portal")
 logging.basicConfig(level=logging.INFO)
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
+load_dotenv(os.path.join(APP_DIR, ".env"))
+
 DB_PATH = os.path.join(APP_DIR, "chat_portal.db")
 TOKEN_SECRET = os.getenv("CHAT_TOKEN_SECRET", "replace-this-in-production")
 TOKEN_TTL_SECONDS = 7 * 24 * 60 * 60
@@ -41,6 +60,12 @@ CORS_ALLOW_ORIGIN_REGEX = os.getenv(
     "CORS_ALLOW_ORIGIN_REGEX",
     r"^https?://(localhost|127\.0\.0\.1|10(?:\.\d{1,3}){3}|192\.168(?:\.\d{1,3}){2}|172\.(?:1[6-9]|2\d|3[0-1])(?:\.\d{1,3}){2})(:\d+)?$",
 )
+
+FTPS_HOST = os.getenv("FTPS_HOST", "127.0.0.1")
+FTPS_PORT = int(os.getenv("FTPS_PORT", "2121"))
+FTPS_USER = os.getenv("FTPS_USER", "foo")
+FTPS_PASSWORD = os.getenv("FTPS_PASSWORD", "S3cureP@ssw0rd!")
+FTPS_INSECURE = os.getenv("FTPS_INSECURE", "true").lower() == "true"
 
 app = FastAPI(title="CS3001 Chat Portal Backend", version="2.0.0")
 
@@ -115,7 +140,25 @@ def init_db() -> None:
                 FOREIGN KEY (sender_id) REFERENCES users(id) ON DELETE CASCADE
             );
 
+            CREATE TABLE IF NOT EXISTS files (
+                file_id TEXT PRIMARY KEY,
+                room_id TEXT NOT NULL,
+                uploader_id INTEGER NOT NULL,
+                name TEXT NOT NULL,
+                format TEXT NOT NULL,
+                size INTEGER NOT NULL,
+                content_type TEXT,
+                storage_path TEXT NOT NULL,
+                status TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                uploaded_at TEXT,
+                last_error TEXT,
+                FOREIGN KEY (room_id) REFERENCES rooms(id) ON DELETE CASCADE,
+                FOREIGN KEY (uploader_id) REFERENCES users(id) ON DELETE CASCADE
+            );
+
             CREATE INDEX IF NOT EXISTS idx_messages_room_id ON messages(room_id, id);
+            CREATE INDEX IF NOT EXISTS idx_files_room_id ON files(room_id, created_at);
             """
         )
         columns = {row["name"] for row in conn.execute("PRAGMA table_info(users)").fetchall()}
@@ -128,6 +171,64 @@ def init_db() -> None:
             conn.execute("ALTER TABLE messages ADD COLUMN is_deleted INTEGER NOT NULL DEFAULT 0")
         if "deleted_at" not in message_columns:
             conn.execute("ALTER TABLE messages ADD COLUMN deleted_at TEXT")
+
+        file_columns = {row["name"] for row in conn.execute("PRAGMA table_info(files)").fetchall()}
+        if file_columns:
+            if "uploaded_at" not in file_columns:
+                conn.execute("ALTER TABLE files ADD COLUMN uploaded_at TEXT")
+            if "last_error" not in file_columns:
+                conn.execute("ALTER TABLE files ADD COLUMN last_error TEXT")
+
+
+def sanitize_format(value: str | None) -> str:
+    if not value:
+        return "bin"
+    cleaned = "".join(ch for ch in value.lower() if ch.isalnum())
+    return cleaned or "bin"
+
+
+def build_storage_path(room_id: str, file_id: str, file_format: str) -> str:
+    return f"{room_id}/{file_id}.{file_format}"
+
+
+def build_ftps_url(storage_path: str) -> str:
+    return f"ftps://{FTPS_USER}:{FTPS_PASSWORD}@{FTPS_HOST}:{FTPS_PORT}/{storage_path}"
+
+
+def run_ftps_upload(local_path: str, storage_path: str, file_id: str) -> None:
+    url = build_ftps_url(storage_path)
+    command = [
+        "curl",
+        "--ftp-ssl",
+        "--ssl-reqd",
+        "--ftp-create-dirs",
+        "-T",
+        local_path,
+        url,
+    ]
+    if FTPS_INSECURE:
+        command.insert(1, "--insecure")
+
+    try:
+        subprocess.run(command, check=True, capture_output=True, text=True)
+    except subprocess.CalledProcessError as exc:
+        error_text = (exc.stderr or exc.stdout or "").strip()
+        with get_conn() as conn:
+            conn.execute(
+                "UPDATE files SET status = ?, last_error = ? WHERE file_id = ?",
+                ("failed", error_text[:500], file_id),
+            )
+        return
+
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE files SET status = ?, uploaded_at = ? WHERE file_id = ?",
+            ("uploaded", now_iso(), file_id),
+        )
+    try:
+        os.remove(local_path)
+    except OSError:
+        logger.warning("Unable to delete temp upload %s", local_path)
 
 
 def set_user_presence(user_id: int, *, online: bool) -> None:
@@ -283,6 +384,17 @@ class FTPUploadPlaceholderRequest(BaseModel):
     file_name: str = Field(min_length=1, max_length=255)
     file_size: int = Field(ge=0)
     content_type: str | None = Field(default=None, max_length=255)
+
+
+class FileUploadResponse(BaseModel):
+    file_id: str
+    room_id: str
+    name: str
+    format: str
+    size: int
+    content_type: str | None
+    created_at: str
+    status: str
 
 
 class ConnectionManager:
@@ -1038,6 +1150,143 @@ async def ftp_upload_placeholder(
     )
 
 
+@app.post("/files/upload", response_model=FileUploadResponse)
+async def upload_file(
+    room_id: str = Form(...),
+    file: UploadFile = File(...),
+    current_user: dict[str, Any] = Depends(get_current_user),
+) -> FileUploadResponse:
+    with get_conn() as conn:
+        get_room_or_404(conn, room_id)
+        ensure_room_member(conn, room_id, current_user["id"])
+
+    if not file.filename:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Missing filename")
+
+    _, extension = os.path.splitext(file.filename)
+    file_format = sanitize_format(extension.lstrip("."))
+    file_id = uuid.uuid4().hex
+    created_at = now_iso()
+    storage_path = build_storage_path(room_id, file_id, file_format)
+
+    temp_handle = tempfile.NamedTemporaryFile(delete=False, suffix=f".{file_format}")
+    local_path = temp_handle.name
+    try:
+        while True:
+            chunk = await file.read(1024 * 1024)
+            if not chunk:
+                break
+            temp_handle.write(chunk)
+    finally:
+        temp_handle.close()
+
+    file_size = os.path.getsize(local_path)
+
+    with get_conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO files (
+                file_id,
+                room_id,
+                uploader_id,
+                name,
+                format,
+                size,
+                content_type,
+                storage_path,
+                status,
+                created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                file_id,
+                room_id,
+                current_user["id"],
+                file.filename,
+                file_format,
+                file_size,
+                file.content_type,
+                storage_path,
+                "pending",
+                created_at,
+            ),
+        )
+
+    upload_thread = threading.Thread(
+        target=run_ftps_upload,
+        args=(local_path, storage_path, file_id),
+        daemon=True,
+    )
+    upload_thread.start()
+
+    return FileUploadResponse(
+        file_id=file_id,
+        room_id=room_id,
+        name=file.filename,
+        format=file_format,
+        size=file_size,
+        content_type=file.content_type,
+        created_at=created_at,
+        status="pending",
+    )
+
+
+@app.get("/files/{room_id}/{file_id}")
+async def download_file(
+    room_id: str,
+    file_id: str,
+    background_tasks: BackgroundTasks,
+    current_user: dict[str, Any] = Depends(get_current_user),
+) -> FileResponse:
+    with get_conn() as conn:
+        get_room_or_404(conn, room_id)
+        ensure_room_member(conn, room_id, current_user["id"])
+        row = conn.execute(
+            "SELECT * FROM files WHERE file_id = ? AND room_id = ?",
+            (file_id, room_id),
+        ).fetchone()
+
+    if row is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="File not found")
+
+    if row["status"] != "uploaded":
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="File is not ready for download")
+
+    storage_path = row["storage_path"]
+    url = build_ftps_url(storage_path)
+    suffix = f".{row['format']}" if row["format"] else ""
+    temp_handle = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+    temp_path = temp_handle.name
+    temp_handle.close()
+
+    command = [
+        "curl",
+        "--ftp-ssl",
+        "--ssl-reqd",
+        "-o",
+        temp_path,
+        url,
+    ]
+    if FTPS_INSECURE:
+        command.insert(1, "--insecure")
+
+    try:
+        subprocess.run(command, check=True, capture_output=True, text=True)
+    except subprocess.CalledProcessError as exc:
+        error_text = (exc.stderr or exc.stdout or "").strip()
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Failed to fetch file from FTPS server: {error_text}",
+        ) from exc
+
+    background_tasks.add_task(os.remove, temp_path)
+    return FileResponse(
+        temp_path,
+        media_type=row["content_type"] or "application/octet-stream",
+        filename=row["name"],
+    )
+
+
 def normalize_ws_packet(
     packet: dict[str, Any],
     *,
@@ -1094,6 +1343,33 @@ def normalize_ws_packet(
             "sender": sender_name,
             "senderUsername": sender_username,
             "fileName": file_name,
+            "fileSize": file_size,
+            "contentType": content_type if isinstance(content_type, str) else None,
+            "sentAt": sent_at,
+        }
+
+    if packet_type == "file":
+        file_id = packet.get("fileId")
+        file_name = packet.get("fileName")
+        file_format = packet.get("format")
+        file_size = packet.get("fileSize")
+        content_type = packet.get("contentType")
+        if (
+            not isinstance(file_id, str)
+            or not isinstance(file_name, str)
+            or not isinstance(file_format, str)
+            or not isinstance(file_size, int)
+        ):
+            return None
+        return {
+            "type": "file",
+            "roomId": room_id,
+            "senderId": user_id,
+            "sender": sender_name,
+            "senderUsername": sender_username,
+            "fileId": file_id,
+            "fileName": file_name,
+            "format": file_format,
             "fileSize": file_size,
             "contentType": content_type if isinstance(content_type, str) else None,
             "sentAt": sent_at,
@@ -1181,6 +1457,18 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, token: str | No
                     )
 
             if normalized_packet["type"] == "chat":
+                with get_conn() as conn:
+                    serialized_packet_for_storage = json.dumps(normalized_packet, separators=(",", ":"))
+                    cursor = conn.execute(
+                        """
+                        INSERT INTO messages (room_id, sender_id, payload, created_at)
+                        VALUES (?, ?, ?, ?)
+                        """,
+                        (room_id, user_id, serialized_packet_for_storage, normalized_packet["sentAt"]),
+                    )
+                    normalized_packet["messageId"] = int(cursor.lastrowid)
+
+            if normalized_packet["type"] == "file":
                 with get_conn() as conn:
                     serialized_packet_for_storage = json.dumps(normalized_packet, separators=(",", ":"))
                     cursor = conn.execute(
