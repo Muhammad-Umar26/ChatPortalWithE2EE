@@ -78,6 +78,12 @@ p {
   display: grid;
   grid-template-rows: auto auto auto;
   gap: 18px;
+  width: min(1180px, 100%);
+  margin: 0 auto;
+}
+
+.landing-screen .card {
+  width: 100%;
 }
 
 .landing-nav {
@@ -105,34 +111,68 @@ p {
 
 .landing-hero {
   display: grid;
-  grid-template-columns: 1.25fr 1fr;
+  grid-template-columns: minmax(0, 1.12fr) minmax(0, 0.88fr);
   gap: 18px;
+  align-items: stretch;
 }
 
 .landing-hero-main {
   display: grid;
-  gap: 12px;
+  gap: 13px;
+  align-content: start;
+}
+
+.landing-kicker {
+  display: inline-flex;
+  width: fit-content;
+  border-radius: 999px;
+  padding: 6px 10px;
+  font-size: 0.75rem;
+  font-weight: 700;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  color: #4338ca;
+  background: rgba(99, 102, 241, 0.12);
+  border: 1px solid rgba(99, 102, 241, 0.2);
 }
 
 .landing-hero-main h1 {
-  font-size: clamp(1.9rem, 3.4vw, 2.8rem);
-  line-height: 1.15;
+  font-size: clamp(2rem, 3.2vw, 3rem);
+  line-height: 1.1;
   color: #0f172a;
+  max-width: 20ch;
 }
 
 .landing-tagline {
-  line-height: 1.6;
-  max-width: 56ch;
+  line-height: 1.58;
+  max-width: 62ch;
+  color: #334155;
+}
+
+.landing-quick-points {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.landing-quick-points span {
+  border-radius: 999px;
+  padding: 6px 10px;
+  font-size: 0.82rem;
+  font-weight: 600;
+  background: rgba(15, 23, 42, 0.06);
+  border: 1px solid rgba(148, 163, 184, 0.3);
   color: #334155;
 }
 
 .landing-actions {
-  margin-top: 2px;
+  margin-top: 4px;
 }
 
 .landing-hero-stats {
   display: grid;
   gap: 10px;
+  align-content: start;
 }
 
 .landing-stat {
@@ -156,7 +196,7 @@ p {
 .landing-feature-grid {
   display: grid;
   gap: 14px;
-  grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
 }
 
 .landing-feature-card {
@@ -625,8 +665,8 @@ button.danger {
   bottom: calc(100% + 10px);
   left: 0;
   z-index: 5;
-  width: min(360px, 88vw);
-  max-height: 260px;
+  width: min(420px, 92vw);
+  max-height: 300px;
   overflow-y: auto;
   display: flex;
   flex-wrap: wrap;
@@ -639,14 +679,17 @@ button.danger {
 }
 
 .emoji-btn {
-  min-width: 38px;
-  min-height: 34px;
-  padding: 6px;
+  min-width: 36px;
+  min-height: 36px;
+  padding: 5px;
   border-radius: 10px;
   background: #f8fafc;
   border: 1px solid #e2e8f0;
   color: #0f172a;
   box-shadow: none;
+  font-family: "Segoe UI Emoji", "Apple Color Emoji", "Noto Color Emoji", sans-serif;
+  font-size: 1.15rem;
+  line-height: 1;
 }
 
 .emoji-btn:hover {
@@ -685,6 +728,10 @@ button.danger {
 
   .landing-hero {
     grid-template-columns: 1fr;
+  }
+
+  .landing-hero-main h1 {
+    max-width: none;
   }
 }
 
@@ -739,6 +786,11 @@ button.danger {
 
   .landing-nav .row button {
     flex: 1;
+  }
+
+  .landing-quick-points {
+    display: grid;
+    grid-template-columns: 1fr;
   }
 
   .message {

@@ -58,14 +58,12 @@ function buildFullEmojiCatalog() {
   }
 
   try {
-    const emojiMatcher = /\p{Extended_Pictographic}/u
+    const emojiPresentationMatcher = /\p{Emoji_Presentation}/u
+    const emojiComponentMatcher = /\p{Emoji_Component}/u
     const ranges = [
       [0x1f300, 0x1f5ff],
       [0x1f600, 0x1f64f],
       [0x1f680, 0x1f6ff],
-      [0x1f700, 0x1f77f],
-      [0x1f780, 0x1f7ff],
-      [0x1f800, 0x1f8ff],
       [0x1f900, 0x1f9ff],
       [0x1fa70, 0x1faff],
       [0x2600, 0x26ff],
@@ -74,7 +72,8 @@ function buildFullEmojiCatalog() {
     for (const [start, end] of ranges) {
       for (let cp = start; cp <= end; cp += 1) {
         const emoji = String.fromCodePoint(cp)
-        if (emojiMatcher.test(emoji)) {
+        if (emojiComponentMatcher.test(emoji)) continue
+        if (emojiPresentationMatcher.test(emoji)) {
           addEmoji(emoji)
         }
       }
@@ -112,7 +111,34 @@ function buildFullEmojiCatalog() {
     "❤️",
     "🔥",
     "🎉",
-    "✨"
+    "✨",
+    "🫶",
+    "🫡",
+    "🏳️‍🌈",
+    "🏳️‍⚧️",
+    "🇵🇰",
+    "🇺🇸",
+    "🇬🇧",
+    "🇦🇪",
+    "🇮🇳",
+    "🇨🇦",
+    "❤️‍🔥",
+    "❤️‍🩹",
+    "🧑‍💻",
+    "👨‍💻",
+    "👩‍💻",
+    "🧑‍🚀",
+    "👨‍🚀",
+    "👩‍🚀",
+    "🧑‍🎓",
+    "👨‍🎓",
+    "👩‍🎓",
+    "🧑‍⚕️",
+    "👨‍⚕️",
+    "👩‍⚕️",
+    "🧑‍🏫",
+    "👨‍🏫",
+    "👩‍🏫"
   ].forEach(addEmoji)
 
   return list
@@ -441,8 +467,41 @@ function App() {
       const resolvedMessageId = Number(packet.messageId ?? fallbackMeta.id ?? 0) || null
 
       const wrappedAesKey = packet?.encryptedKeys?.[String(user?.id)] ?? packet?.encryptedKeys?.[user?.id]
-      if (!wrappedAesKey || !keyPairRef.current?.privateKey) {
-        return null
+      const timestamp = packet.sentAt || fallbackMeta.created_at || new Date().toISOString()
+      const resolvedSender =
+        senderId === user?.id
+          ? "You"
+          : senderUsername
+            ? `${senderName} (@${senderUsername})`
+            : senderName
+      if (!keyPairRef.current?.privateKey) {
+        return {
+          id: resolvedMessageId ? `msg-${resolvedMessageId}` : `msg-${Date.now()}-${Math.random()}`,
+          messageId: resolvedMessageId,
+          senderId,
+          sender: resolvedSender,
+          content: "[Encrypted message unavailable: local private key not found on this browser.]",
+          timestamp,
+          type: "error",
+          own: senderId === user?.id
+        }
+      }
+
+      if (!wrappedAesKey) {
+        const missingKeyMessage =
+          senderId === user?.id
+            ? "[Encrypted with a previous key pair for this account. Re-login on the original browser/protocol to decrypt.]"
+            : "[Encrypted message unavailable for your current key.]"
+        return {
+          id: resolvedMessageId ? `msg-${resolvedMessageId}` : `msg-${Date.now()}-${Math.random()}`,
+          messageId: resolvedMessageId,
+          senderId,
+          sender: resolvedSender,
+          content: missingKeyMessage,
+          timestamp,
+          type: "error",
+          own: senderId === user?.id
+        }
       }
 
       let content = ""
@@ -460,14 +519,9 @@ function App() {
         id: resolvedMessageId ? `msg-${resolvedMessageId}` : `msg-${Date.now()}-${Math.random()}`,
         messageId: resolvedMessageId,
         senderId,
-        sender:
-          senderId === user?.id
-            ? "You"
-            : senderUsername
-              ? `${senderName} (@${senderUsername})`
-              : senderName,
+        sender: resolvedSender,
         content,
-        timestamp: packet.sentAt || fallbackMeta.created_at || new Date().toISOString(),
+        timestamp,
         type: decryptFailed ? "error" : "chat",
         own: senderId === user?.id
       }
@@ -1123,11 +1177,17 @@ function App() {
 
         <section className="card landing-hero">
           <div className="landing-hero-main">
-            <h1>Secure team chat with rooms, encryption, and real-time presence</h1>
+            <p className="landing-kicker">Secure collaboration workspace</p>
+            <h1>Modern encrypted room chat with clean, fast real-time UX</h1>
             <p className="landing-tagline">
-              Authenticated multi-room chat with end-to-end encryption. FastAPI + React powered workspace
-              designed for your CS3001 network project and scalable feature extensions.
+              End-to-end encrypted multi-room chat built with FastAPI, WebSockets, and React. Designed for
+              live demos, teamwork, and extensible networking coursework.
             </p>
+            <div className="landing-quick-points">
+              <span>End-to-end encrypted payloads</span>
+              <span>Live room activity and presence</span>
+              <span>Owner moderation controls</span>
+            </div>
             <div className="row landing-actions">
               <button
                 onClick={() => {
@@ -1151,38 +1211,21 @@ function App() {
             </div>
           </div>
           <div className="landing-hero-stats">
-            <article className="landing-stat">
-              <h3>E2EE by design</h3>
-              <p>Server routes encrypted packets only and never decrypts content.</p>
-            </article>
-            <article className="landing-stat">
-              <h3>Live collaboration</h3>
-              <p>Presence, room activity, and messaging update in realtime over WebSockets.</p>
-            </article>
-            <article className="landing-stat">
-              <h3>Project-ready backend</h3>
-              <p>Includes auth, room ownership flow, and FTP integration placeholder endpoints.</p>
-            </article>
+            <section className="landing-feature-grid">
+              <article className="card landing-feature-card">
+                <h3>End-to-End Encryption</h3>
+                <p>RSA key exchange and AES-GCM payload encryption handled on client devices.</p>
+              </article>
+              <article className="card landing-feature-card">
+                <h3>Room Ownership Controls</h3>
+                <p>Owner can remove members, transfer ownership, and moderate room membership cleanly.</p>
+              </article>
+              <article className="card landing-feature-card">
+                <h3>Persistent History</h3>
+                <p>Encrypted message packets and membership records are saved and loaded from database.</p>
+              </article>
+            </section>
           </div>
-        </section>
-
-        <section className="landing-feature-grid">
-          <article className="card landing-feature-card">
-            <h3>End-to-End Encryption</h3>
-            <p>RSA key exchange and AES-GCM payload encryption handled on client devices.</p>
-          </article>
-          <article className="card landing-feature-card">
-            <h3>Room Ownership Controls</h3>
-            <p>Owner can remove members, transfer ownership, and moderate room membership cleanly.</p>
-          </article>
-          <article className="card landing-feature-card">
-            <h3>Persistent History</h3>
-            <p>Encrypted message packets and membership records are saved and loaded from database.</p>
-          </article>
-          <article className="card landing-feature-card">
-            <h3>Responsive UI</h3>
-            <p>Optimized layouts for mobile, tablet, and desktop with room/chat scroll isolation.</p>
-          </article>
         </section>
       </div>
     )

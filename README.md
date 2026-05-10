@@ -1,4 +1,4 @@
-# CS3001 Chat Portal (FastAPI + React + E2EE)
+# Chat Portal (FastAPI + React + E2EE)
 
 This project is now an authenticated, multi-room chat portal with persistent room/message records and frontend end-to-end encryption.
 
