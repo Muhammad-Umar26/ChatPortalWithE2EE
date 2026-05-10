@@ -911,7 +911,7 @@ async def list_room_messages(
     with get_conn() as conn:
         get_room_or_404(conn, room_id)
         membership = conn.execute(
-            "SELECT joined_at FROM room_members WHERE room_id = ? AND user_id = ?",
+            "SELECT 1 FROM room_members WHERE room_id = ? AND user_id = ?",
             (room_id, current_user["id"]),
         ).fetchone()
         if membership is None:
@@ -930,13 +930,13 @@ async def list_room_messages(
                     u.display_name AS sender_display_name
                 FROM messages m
                 JOIN users u ON u.id = m.sender_id
-                WHERE m.room_id = ? AND m.created_at >= ?
+                WHERE m.room_id = ?
                 ORDER BY m.id DESC
                 LIMIT ?
             ) recent
             ORDER BY recent.id ASC
             """,
-            (room_id, membership["joined_at"], limit),
+            (room_id, limit),
         ).fetchall()
 
     messages = []
